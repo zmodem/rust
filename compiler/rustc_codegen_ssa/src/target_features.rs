@@ -304,7 +304,7 @@ pub fn cfg_target_feature<'a, const N: usize>(
                             enabled: if enable { "enabled" } else { "disabled" },
                             reason,
                         });
-                    } else if stability.requires_nightly().is_some() {
+                    } else if stability.requires_nightly().is_some() && base_feature != "outline-atomics" {
                         // An unstable feature. Warn about using it. It makes little sense
                         // to hard-error here since we just warn about fully unknown
                         // features above.
