@@ -6,7 +6,7 @@ use rustc_abi::{ExternAbi, FieldIdx};
 use rustc_hir::attrs::lang_items::LangItem;
 use rustc_middle::span_bug;
 use rustc_middle::ty::layout::TyAndLayout;
-use rustc_middle::ty::{self, Const, FnHeader, FnSigKind, FnSigTys, ScalarInt, Ty, TyCtxt};
+use rustc_middle::ty::{self, FnHeader, FnSigKind, FnSigTys, ScalarInt, Ty, TyCtxt};
 use rustc_span::{Symbol, sym};
 
 use crate::const_eval::CompileTimeMachine;
@@ -82,13 +82,9 @@ impl<'tcx> InterpCx<'tcx, CompileTimeMachine<'tcx>> {
                             self.write_tuple_type_info(tuple_place, fields, ty)?;
                             variant
                         }
-                        ty::Array(ty, len) => {
-                            let (variant, variant_place) =
+                        ty::Array(_, _) => {
+                            let (variant, _variant_place) =
                                 self.project_downcast_named(&field_dest, sym::Array)?;
-                            let array_place = self.project_field(&variant_place, FieldIdx::ZERO)?;
-
-                            self.write_array_type_info(array_place, *ty, *len)?;
-
                             variant
                         }
                         ty::Slice(_) => {
@@ -234,55 +230,6 @@ impl<'tcx> InterpCx<'tcx, CompileTimeMachine<'tcx>> {
             },
         )
     }
-
-    pub(crate) fn write_array_type_info(
-        &mut self,
-        place: impl Writeable<'tcx, CtfeProvenance>,
-        ty: Ty<'tcx>,
-        len: Const<'tcx>,
-    ) -> InterpResult<'tcx> {
-        // Iterate over all fields of `type_info::Array`.
-        for (field_idx, field) in
-            place.layout().ty.ty_adt_def().unwrap().non_enum_variant().fields.iter_enumerated()
-        {
-            let field_place = self.project_field(&place, field_idx)?;
-
-            match field.name {
-                // Write the `TypeId` of the array's elements to the `element_ty` field.
-                sym::element_ty => self.write_type_id(ty, &field_place)?,
-                // Write the length of the array to the `len` field.
-                sym::len => self.write_scalar(len.to_leaf(), &field_place)?,
-                other => span_bug!(self.tcx.def_span(field.did), "unimplemented field {other}"),
-            }
-        }
-
-        interp_ok(())
-    }
-
-     pub(crate) fn write_reference_type_info(
-         &mut self,
-         place: impl Writeable<'tcx, CtfeProvenance>,
-         ty: Ty<'tcx>,
-         mutability: Mutability,
-     ) -> InterpResult<'tcx> {
-         // Iterate over all fields of `type_info::Reference`.
-         for (field_idx, field) in
-             place.layout().ty.ty_adt_def().unwrap().non_enum_variant().fields.iter_enumerated()
-         {
-             let field_place = self.project_field(&place, field_idx)?;
-
-             match field.name {
-                 // Write the `TypeId` of the reference's inner type to the `ty` field.
-                 sym::pointee => self.write_type_id(ty, &field_place)?,
-                 // Write the boolean representing the reference's mutability to the `mutable` field.
-                 sym::mutable => {
-                     self.write_scalar(Scalar::from_bool(mutability.is_mut()), &field_place)?
-                 }
-                 other => span_bug!(self.tcx.def_span(field.did), "unimplemented field {other}"),
-             }
-         }
-         interp_ok(())
-     }
 
     pub(crate) fn write_type_id_generics(
         &mut self,
