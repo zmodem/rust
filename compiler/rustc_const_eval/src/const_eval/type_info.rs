@@ -91,13 +91,9 @@ impl<'tcx> InterpCx<'tcx, CompileTimeMachine<'tcx>> {
 
                             variant
                         }
-                        ty::Slice(ty) => {
-                            let (variant, variant_place) =
+                        ty::Slice(_) => {
+                            let (variant, _variant_place) =
                                 self.project_downcast_named(&field_dest, sym::Slice)?;
-                            let slice_place = self.project_field(&variant_place, FieldIdx::ZERO)?;
-
-                            self.write_slice_type_info(slice_place, *ty)?;
-
                             variant
                         }
                         ty::Adt(adt_def, generics) => {
@@ -263,26 +259,30 @@ impl<'tcx> InterpCx<'tcx, CompileTimeMachine<'tcx>> {
         interp_ok(())
     }
 
-    pub(crate) fn write_slice_type_info(
-        &mut self,
-        place: impl Writeable<'tcx, CtfeProvenance>,
-        ty: Ty<'tcx>,
-    ) -> InterpResult<'tcx> {
-        // Iterate over all fields of `type_info::Slice`.
-        for (field_idx, field) in
-            place.layout().ty.ty_adt_def().unwrap().non_enum_variant().fields.iter_enumerated()
-        {
-            let field_place = self.project_field(&place, field_idx)?;
+     pub(crate) fn write_reference_type_info(
+         &mut self,
+         place: impl Writeable<'tcx, CtfeProvenance>,
+         ty: Ty<'tcx>,
+         mutability: Mutability,
+     ) -> InterpResult<'tcx> {
+         // Iterate over all fields of `type_info::Reference`.
+         for (field_idx, field) in
+             place.layout().ty.ty_adt_def().unwrap().non_enum_variant().fields.iter_enumerated()
+         {
+             let field_place = self.project_field(&place, field_idx)?;
 
-            match field.name {
-                // Write the `TypeId` of the slice's elements to the `element_ty` field.
-                sym::element_ty => self.write_type_id(ty, &field_place)?,
-                other => span_bug!(self.tcx.def_span(field.did), "unimplemented field {other}"),
-            }
-        }
-
-        interp_ok(())
-    }
+             match field.name {
+                 // Write the `TypeId` of the reference's inner type to the `ty` field.
+                 sym::pointee => self.write_type_id(ty, &field_place)?,
+                 // Write the boolean representing the reference's mutability to the `mutable` field.
+                 sym::mutable => {
+                     self.write_scalar(Scalar::from_bool(mutability.is_mut()), &field_place)?
+                 }
+                 other => span_bug!(self.tcx.def_span(field.did), "unimplemented field {other}"),
+             }
+         }
+         interp_ok(())
+     }
 
     pub(crate) fn write_type_id_generics(
         &mut self,
