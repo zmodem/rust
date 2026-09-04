@@ -344,7 +344,7 @@ pub enum ExprKind<'tcx> {
     /// expression. This is inserted in some places where an operation would
     /// otherwise be erased completely (e.g. some no-op casts), but we still
     /// need to ensure that its operand is treated as a value and not a place.
-    Use {
+    ValueExpr {
         source: ExprId,
     },
     /// A coercion from `!` to any type.
@@ -817,8 +817,6 @@ pub enum PatKind<'tcx> {
 
     /// Explicit or implicit `deref!(..)` pattern, under `feature(deref_patterns)`.
     /// Represents a call to `Deref` or `DerefMut`, or a deref-move of `Box`.
-    ///
-    /// `box P` patterns also lower to this, under `feature(box_patterns)`.
     DerefPattern {
         subpattern: Box<Pat<'tcx>>,
         /// Whether the pattern scrutinee needs to be borrowed in order to call `Deref::deref` or

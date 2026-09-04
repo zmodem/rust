@@ -23,10 +23,10 @@ use crate::core::backend::CodegenBackendKind;
 use crate::core::build_steps::compile::{
     get_codegen_backend_file, libgccjit_path_relative_to_cg_dir, normalize_codegen_backend_name,
 };
-use crate::core::build_steps::doc::DocumentationFormat;
+use crate::core::build_steps::doc::{CompilerWithTools, DocumentationFormat};
 use crate::core::build_steps::gcc::GccTargetPair;
 use crate::core::build_steps::llvm::{
-    LLVM_CI_LINK_TYPE_PATH, LlvmBuildStatus, get_llvm_build_status,
+    LLVM_CI_LINK_TYPE_PATH, LlvmBuildStatus, LlvmKind, get_llvm_build_status,
 };
 use crate::core::build_steps::tool::{
     self, RustcPrivateCompilers, ToolTargetBuildMode, get_tool_target_compiler,
@@ -60,9 +60,10 @@ pub(crate) const LLVM_TOOLS: &[&str] = &[
     "llvm-ar",       // used for creating and modifying archive files
     "llvm-as",       // used to convert LLVM assembly to LLVM bitcode
     "llvm-dis",      // used to disassemble LLVM bitcode
-    "llvm-link",     // Used to link LLVM bitcode
-    "llc",           // used to compile LLVM bytecode
-    "opt",           // used to optimize LLVM bytecode
+    "llvm-link",     // used to link LLVM bitcode
+    "llc",           // used to compile LLVM IR
+    "opt",           // used to optimize LLVM IR
+    "llubi",         // used to execute LLVM while checking for Undefined Behavior
 ];
 
 /// LLD file names for all flavors.
@@ -184,7 +185,7 @@ impl CommandLineStep for JsonDocs {
     }
 }
 
-/// Builds the `rustc-docs` installer component.
+/// Builds the `rustc-docs` component.
 /// Apart from the documentation of the `rustc_*` crates, it also includes the documentation of
 /// various in-tree helper tools (bootstrap, build_helper, tidy),
 /// and also rustc_private tools like rustdoc, clippy, miri or rustfmt.
@@ -213,11 +214,12 @@ impl CommandLineStep for RustcDocs {
 
     fn run(self, builder: &Builder<'_>) -> Self::Output {
         let target = self.target;
-        builder.run_default_doc_steps();
+        let combined_docs =
+            builder.ensure(CompilerWithTools::for_stage(builder, builder.top_stage, self.target));
 
         let mut tarball = Tarball::new(builder, "rustc-docs", &target.triple);
         tarball.set_product_name("Rustc Documentation");
-        tarball.add_bulk_dir(builder.compiler_doc_out(target), "share/doc/rust/html/rustc-docs");
+        tarball.add_bulk_dir(combined_docs, "share/doc/rust/html/rustc-docs");
         tarball.generate()
     }
 }
@@ -664,7 +666,7 @@ impl CommandLineStep for Rustc {
                 let page_src = file_entry.path();
                 let page_dst = man_dst.join(file_entry.file_name());
                 let src_text = t!(std::fs::read_to_string(&page_src));
-                let version = builder.rust_info().version(builder.build, &builder.version);
+                let version = builder.rust_info().version(builder.sess, &builder.version);
                 let new_text = src_text.replace("<INSERT VERSION HERE>", &version);
                 t!(std::fs::write(&page_dst, &new_text));
             }
@@ -774,7 +776,7 @@ impl Step for DebuggerScripts {
         cp_debugger_script("gdb_load_rust_pretty_printers.py");
         cp_debugger_script("gdb_lookup.py");
         cp_debugger_script("gdb_providers.py");
-        if builder.build.unstable_features() {
+        if builder.sess.unstable_features() {
             cp_debugger_script("gdb_trim_paths.py");
         }
 
@@ -787,7 +789,7 @@ impl Step for DebuggerScripts {
 
         cp_debugger_script("lldb_lookup.py");
         cp_debugger_script("lldb_providers.py");
-        if builder.build.unstable_features() {
+        if builder.sess.unstable_features() {
             cp_debugger_script("lldb_trim_paths.py");
         }
     }
@@ -1624,7 +1626,7 @@ impl CommandLineStep for Miri {
         // This prevents miri from being built for "dist" or "install"
         // on the stable/beta channels. It is a nightly-only tool and should
         // not be included.
-        if !builder.build.unstable_features() {
+        if !builder.sess.unstable_features() {
             return None;
         }
 
@@ -1681,7 +1683,7 @@ impl CommandLineStep for CraneliftCodegenBackend {
         // This prevents rustc_codegen_cranelift from being built for "dist"
         // or "install" on the stable/beta channels. It is not yet stable and
         // should not be included.
-        if !builder.build.unstable_features() {
+        if !builder.sess.unstable_features() {
             return None;
         }
 
@@ -1755,7 +1757,7 @@ impl CommandLineStep for GccCodegenBackend {
         // This prevents rustc_codegen_gcc from being built for "dist"
         // or "install" on the stable/beta channels. It is not yet stable and
         // should not be included.
-        if !builder.build.unstable_features() {
+        if !builder.sess.unstable_features() {
             return None;
         }
 
@@ -2525,12 +2527,7 @@ fn maybe_install_llvm(
     // If the LLVM is coming from ourselves (just from CI) though, we
     // still want to install it, as it otherwise won't be available.
 
-    // FIXME: this should be simplified once we stop pre-setting LLVM CI llvm-config during
-    // config parsing.
-    let is_system_llvm =
-        builder.config.target_config.get(&target).and_then(|t| t.llvm_config.as_ref()).is_some()
-            && !(builder.config.llvm_ci_mode.download_from_ci()
-                && builder.config.is_host_target(target));
+    let is_system_llvm = llvm.llvm_output().kind() == LlvmKind::External;
     if is_system_llvm {
         trace!("system LLVM requested, no install");
         return false;
@@ -2542,13 +2539,13 @@ fn maybe_install_llvm(
     // paths and we don't want those in the sysroot (as we're expecting
     // unversioned paths).
     if target.contains("apple-darwin") && llvm.llvm_output().link_shared() {
-        let src_libdir = builder.llvm_out(target).join("lib");
+        let src_libdir = llvm.llvm_output().root_dir().join("lib");
         let llvm_dylib_path = src_libdir.join("libLLVM.dylib");
         if llvm_dylib_path.exists() {
             builder.install(&llvm_dylib_path, dst_libdir, FileType::NativeLibrary);
 
-            if install_symlink && let Some(llvm_config_path) = &builder.llvm_config(target) {
-                let major = llvm::get_llvm_version_major(builder, llvm_config_path);
+            if install_symlink {
+                let major = llvm::get_llvm_version_major(builder, &builder.host_llvm_config());
                 let versioned_name = match &builder.config.llvm_version_suffix {
                     Some(version_suffix) => format!("libLLVM-{major}{version_suffix}.dylib"),
                     None => {
@@ -2567,18 +2564,17 @@ fn maybe_install_llvm(
             }
         }
         !builder.config.dry_run()
-    } else if let llvm::LlvmBuildStatus::AlreadyBuilt(llvm::LlvmOutput {
-        host_llvm_config, ..
-    }) = llvm
-    {
+    } else if let llvm::LlvmBuildStatus::AlreadyBuilt(llvm_output) = llvm {
         trace!("LLVM already built, installing LLVM files");
-        let mut cmd = command(host_llvm_config);
+
+        let host_llvm = builder.ensure(llvm::Llvm { target: builder.host_target });
+        let mut cmd = command(host_llvm.llvm_config());
         cmd.cached();
         cmd.arg("--libfiles");
         builder.do_if_verbose(|| println!("running {cmd:?}"));
         let files = cmd.run_capture_stdout(builder).stdout();
-        let build_llvm_out = &builder.llvm_out(builder.config.host_target);
-        let target_llvm_out = &builder.llvm_out(target);
+        let build_llvm_out = host_llvm.root_dir();
+        let target_llvm_out = llvm_output.root_dir();
         for file in files.trim_end().split(' ') {
             // If we're not using a custom LLVM, make sure we package for the target.
             let file = if let Ok(relative_path) = Path::new(file).strip_prefix(build_llvm_out) {
@@ -2713,11 +2709,10 @@ impl CommandLineStep for LlvmTools {
 
         let target = self.target;
 
+        let llvm_output = builder.ensure(crate::core::build_steps::llvm::Llvm { target });
+
         // Run only if a custom llvm-config is not used
-        if let Some(config) = builder.config.target_config.get(&target)
-            && !builder.config.llvm_ci_mode.download_from_ci()
-            && config.llvm_config.is_some()
-        {
+        if llvm_output.kind() == LlvmKind::External {
             builder.info(&format!("Skipping LlvmTools ({target}): external LLVM"));
             return None;
         }
@@ -2725,8 +2720,6 @@ impl CommandLineStep for LlvmTools {
         if !builder.config.dry_run() {
             builder.require_submodule("src/llvm-project", None);
         }
-
-        let llvm_output = builder.ensure(crate::core::build_steps::llvm::Llvm { target });
 
         let mut tarball = Tarball::new(builder, "llvm-tools", &target.triple);
         tarball.set_overlay(OverlayKind::Llvm);
@@ -2739,7 +2732,7 @@ impl CommandLineStep for LlvmTools {
             for tool in tools_to_install(&builder.paths) {
                 let exe = src_bindir.join(exe(tool, target));
                 // When using `download-ci-llvm`, some of the tools may not exist, so skip trying to copy them.
-                if !exe.exists() && builder.config.llvm_ci_mode.download_from_ci() {
+                if !exe.exists() && llvm_output.kind() == LlvmKind::DownloadedFromCi {
                     eprintln!("{} does not exist; skipping copy", exe.display());
                     continue;
                 }
@@ -2837,7 +2830,7 @@ impl CommandLineStep for Enzyme {
         // This prevents Enzyme from being built for "dist"
         // or "install" on the stable/beta channels. It is not yet stable and
         // should not be included.
-        if !builder.build.unstable_features() {
+        if !builder.sess.unstable_features() {
             return None;
         }
 
@@ -3232,7 +3225,7 @@ impl CommandLineStep for Gcc {
         // This prevents gcc from being built for "dist"
         // or "install" on the stable/beta channels. It is not yet stable and
         // should not be included.
-        if !builder.build.unstable_features() {
+        if !builder.sess.unstable_features() {
             return None;
         }
 

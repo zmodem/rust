@@ -657,6 +657,15 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         span_bug!(span, "coerce requirement gave wrong error: `{:?}`", predicate)
                     }
 
+                    ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(..))
+                        if self.next_trait_solver() =>
+                    {
+                        // We normalize `TypeOutlives` in the next solver, which is fallible
+                        return self.dcx().span_delayed_bug(
+                            span,
+                            "type outlives claues errored outside borrowck without any other error",
+                        );
+                    }
                     ty::PredicateKind::Clause(ty::ClauseKind::RegionOutlives(..))
                     | ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(..)) => {
                         span_bug!(
@@ -1660,8 +1669,6 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         bound_predicate.rebind(data),
                     );
                     let unnormalized_term = data.projection_term.to_term(self.tcx, ty::IsRigid::No);
-                    // FIXME(-Znext-solver): For diagnostic purposes, it would be nice
-                    // to deeply normalize this type.
                     let normalized_term = ocx.normalize(
                         &obligation.cause,
                         obligation.param_env,
@@ -2445,7 +2452,10 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                                         error.root_obligation.cause.span,
                                         format!(
                                             "unsatisfied requirement introduced here: `{}`",
-                                            error.root_obligation.predicate,
+                                            self.tcx.short_string(
+                                                error.root_obligation.predicate,
+                                                err.long_ty_path()
+                                            ),
                                         ),
                                     );
                                 }

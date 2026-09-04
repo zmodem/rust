@@ -505,6 +505,14 @@ def StdPathSummaryProvider(valobj: SBValue, _dict: LLDBOpaque) -> str:
     return read_string(process, start, length)
 
 
+def f16SummaryProvider(valobj: SBValue, _dict: LLDBOpaque) -> str:
+    return (
+        valobj.GetChildAtIndex(0)
+        .Cast(valobj.GetTarget().GetBasicType(eBasicTypeHalf))
+        .GetValue()
+    )
+
+
 def sequence_formatter(output: str, valobj: SBValue, _dict: LLDBOpaque):
     length: int = valobj.GetNumChildren()
 
@@ -1029,19 +1037,14 @@ class TupleSyntheticProvider:
 
     def get_child_index(self, name: str) -> int:
         if name.isdigit():
-            return int(name)
+            return self.valobj.GetIndexOfChildWithName(f"__{name}")
         else:
             return -1
 
     def get_child_at_index(self, index: int) -> Optional[SBValue]:
-        if self.is_variant:
-            field = self.type.GetFieldAtIndex(index + 1)
-        else:
-            field = self.type.GetFieldAtIndex(index)
-        element = self.valobj.GetChildMemberWithName(field.name)
-        return self.valobj.CreateValueFromData(
-            str(index), element.GetData(), element.GetType()
-        )
+        return self.valobj.GetChildAtIndex(
+            self.valobj.GetIndexOfChildWithName(f"__{index}")
+        ).Clone(str(index))
 
     def update(self):
         pass
@@ -1060,12 +1063,15 @@ class MSVCTupleSyntheticProvider:
         return self.valobj.GetNumChildren()
 
     def get_child_index(self, name: str) -> int:
-        return self.valobj.GetIndexOfChildWithName(name)
+        if name.isdigit():
+            return self.valobj.GetIndexOfChildWithName(f"__{name}")
+        else:
+            return -1
 
     def get_child_at_index(self, index: int) -> Optional[SBValue]:
-        child: SBValue = self.valobj.GetChildAtIndex(index)
-        offset = self.valobj.GetType().GetFieldAtIndex(index).byte_offset
-        return self.valobj.CreateChildAtOffset(str(index), offset, child.GetType())
+        return self.valobj.GetChildAtIndex(
+            self.valobj.GetIndexOfChildWithName(f"__{index}")
+        ).Clone(str(index))
 
     def update(self):
         pass
