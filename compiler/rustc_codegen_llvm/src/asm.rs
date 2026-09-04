@@ -16,12 +16,12 @@ use rustc_target::spec::HasTargetSpec;
 use smallvec::SmallVec;
 use tracing::debug;
 
-use crate::attributes;
 use crate::builder::Builder;
 use crate::common::Funclet;
 use crate::context::CodegenCx;
 use crate::llvm::{self, ToLlvmBool, Type, Value};
 use crate::type_of::LayoutLlvmExt;
+use crate::{attributes, llvm_util};
 
 impl<'ll, 'tcx> AsmBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
     fn codegen_inline_asm(
@@ -414,6 +414,7 @@ impl<'tcx> AsmCodegenMethods<'tcx> for CodegenCx<'_, 'tcx> {
         operands: &[GlobalAsmOperandRef<'tcx>],
         options: InlineAsmOptions,
         _line_spans: &[Span],
+        extra_rust_target_features: &[String],
     ) {
         let asm_arch = self.tcx.sess.asm_arch.unwrap();
 
@@ -499,7 +500,27 @@ impl<'tcx> AsmCodegenMethods<'tcx> for CodegenCx<'_, 'tcx> {
             template_str.push_str("\n.att_syntax\n");
         }
 
-        llvm::append_module_inline_asm(self.llmod, template_str.as_bytes());
+        // Globally-enabled features that are already in the backend format.
+        let global_features = self.tcx.global_backend_features(()).iter().map(String::as_str);
+
+        // Features enabled on a particular instance, in the rust format.
+        // These need to be translated to the LLVM format.
+        let function_features: Vec<_> = extra_rust_target_features
+            .iter()
+            .flat_map(|feat| llvm_util::to_llvm_features(self.tcx.sess, feat))
+            .flat_map(|feat| feat.into_iter().map(|f| format!("+{f}")))
+            .collect();
+
+        let function_features = function_features.iter().map(String::as_str);
+        let target_features =
+            global_features.chain(function_features).intersperse(",").collect::<String>();
+
+        llvm::append_module_inline_asm(
+            self.llmod,
+            template_str.as_bytes(),
+            &target_features,
+            llvm_util::target_cpu(self.tcx.sess),
+        );
     }
 
     fn mangled_name(&self, instance: Instance<'tcx>) -> String {
@@ -776,7 +797,7 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'_>>) ->
             | LoongArch(LoongArchInlineAsmRegClass::vreg)
             | LoongArch(LoongArchInlineAsmRegClass::xreg) => "f",
             Mips(MipsInlineAsmRegClass::reg) => "r",
-            Mips(MipsInlineAsmRegClass::freg) => "f",
+            Mips(MipsInlineAsmRegClass::freg | MipsInlineAsmRegClass::wreg) => "f",
             Nvptx(NvptxInlineAsmRegClass::reg16) => "h",
             Nvptx(NvptxInlineAsmRegClass::reg32) => "r",
             Nvptx(NvptxInlineAsmRegClass::reg64) => "l",
@@ -897,7 +918,9 @@ fn modifier_to_llvm(
                 modifier
             }
         }
-        Mips(_) => None,
+        Mips(MipsInlineAsmRegClass::reg) => None,
+        Mips(MipsInlineAsmRegClass::freg) => modifier,
+        Mips(MipsInlineAsmRegClass::wreg) => Some('w'),
         Nvptx(_) => None,
         PowerPC(PowerPCInlineAsmRegClass::vsreg) => {
             // The documentation for the 'x' modifier is missing for llvm, and the gcc
@@ -1003,6 +1026,7 @@ fn dummy_output_type<'ll>(cx: &CodegenCx<'ll, '_>, reg: InlineAsmRegClass) -> &'
         LoongArch(LoongArchInlineAsmRegClass::xreg) => cx.type_vector(cx.type_i32(), 8),
         Mips(MipsInlineAsmRegClass::reg) => cx.type_i32(),
         Mips(MipsInlineAsmRegClass::freg) => cx.type_f32(),
+        Mips(MipsInlineAsmRegClass::wreg) => cx.type_vector(cx.type_i32(), 4),
         Nvptx(NvptxInlineAsmRegClass::reg16) => cx.type_i16(),
         Nvptx(NvptxInlineAsmRegClass::reg32) => cx.type_i32(),
         Nvptx(NvptxInlineAsmRegClass::reg64) => cx.type_i64(),
@@ -1232,7 +1256,10 @@ fn llvm_fixup_input<'ll, 'tcx>(
         (LoongArch(LoongArchInlineAsmRegClass::freg), BackendRepr::Scalar(s))
             if s.primitive() == Primitive::Float(Float::F16) =>
         {
-            // Smaller floats are always "NaN-boxed" inside larger floats on LoongArch.
+            // The LoongArch psABI only requires the upper bits to be widened to
+            // GRLEN, leaving them undefined. We NaN-box instead (set all upper
+            // bits to 1), matching LLVM's own codegen, to avoid an `f16` value
+            // being mistaken for a valid `f32` value.
             let value = bx.bitcast(value, bx.type_i16());
             let value = bx.zext(value, bx.type_i32());
             let value = bx.or(value, bx.const_u32(0xFFFF_0000));
@@ -1241,11 +1268,23 @@ fn llvm_fixup_input<'ll, 'tcx>(
         (Mips(MipsInlineAsmRegClass::reg), BackendRepr::Scalar(s)) => {
             match s.primitive() {
                 // MIPS only supports register-length arithmetics.
-                Primitive::Int(Integer::I8 | Integer::I16, _) => bx.zext(value, bx.cx.type_i32()),
-                Primitive::Float(Float::F32) => bx.bitcast(value, bx.cx.type_i32()),
-                Primitive::Float(Float::F64) => bx.bitcast(value, bx.cx.type_i64()),
+                Primitive::Int(Integer::I8 | Integer::I16, _) => bx.zext(value, bx.type_i32()),
+                Primitive::Float(Float::F16) => {
+                    let value = bx.bitcast(value, bx.type_i16());
+                    bx.zext(value, bx.type_i32())
+                }
+                Primitive::Float(Float::F32) => bx.bitcast(value, bx.type_i32()),
+                Primitive::Float(Float::F64) => bx.bitcast(value, bx.type_i64()),
                 _ => value,
             }
+        }
+        (
+            Mips(MipsInlineAsmRegClass::freg | MipsInlineAsmRegClass::wreg),
+            BackendRepr::Scalar(s),
+        ) if s.primitive() == Primitive::Float(Float::F16) => {
+            let value = bx.bitcast(value, bx.type_i16());
+            let value = bx.zext(value, bx.type_i32());
+            bx.bitcast(value, bx.type_f32())
         }
         (RiscV(RiscVInlineAsmRegClass::freg), BackendRepr::Scalar(s))
             if s.primitive() == Primitive::Float(Float::F16)
@@ -1260,16 +1299,27 @@ fn llvm_fixup_input<'ll, 'tcx>(
         (
             PowerPC(PowerPCInlineAsmRegClass::vreg | PowerPCInlineAsmRegClass::vsreg),
             BackendRepr::Scalar(s),
-        ) if let Primitive::Float(float @ (Float::F32 | Float::F64)) = s.primitive() => {
+        ) if let Primitive::Float(float @ (Float::F16 | Float::F32 | Float::F64)) =
+            s.primitive() =>
+        {
             let num_lanes = 16 / float.size().bytes();
+            // `f16` is located in the rightmost halfword of doubleword 0 per section 7.3.2.5 of
+            // "Power Instruction Set Architecture", version 3.1C.
+            let offset = if float == Float::F16 { 3 } else { 0 };
             bx.insert_element(
                 bx.const_undef(bx.type_vector(bx.type_from_float(float), num_lanes)),
                 value,
                 bx.const_usize(match bx.target_spec().endian {
-                    Endian::Little => num_lanes - 1,
-                    Endian::Big => 0,
+                    Endian::Little => num_lanes - 1 - offset,
+                    Endian::Big => offset,
                 }),
             )
+        }
+        (
+            PowerPC(PowerPCInlineAsmRegClass::vreg | PowerPCInlineAsmRegClass::vsreg),
+            BackendRepr::Scalar(s),
+        ) if s.primitive() == Primitive::Float(Float::F128) => {
+            bx.bitcast(value, bx.type_vector(bx.type_f64(), 2))
         }
         _ => value,
     }
@@ -1406,12 +1456,24 @@ fn llvm_fixup_output<'ll, 'tcx>(
         (Mips(MipsInlineAsmRegClass::reg), BackendRepr::Scalar(s)) => {
             match s.primitive() {
                 // MIPS only supports register-length arithmetics.
-                Primitive::Int(Integer::I8, _) => bx.trunc(value, bx.cx.type_i8()),
-                Primitive::Int(Integer::I16, _) => bx.trunc(value, bx.cx.type_i16()),
-                Primitive::Float(Float::F32) => bx.bitcast(value, bx.cx.type_f32()),
-                Primitive::Float(Float::F64) => bx.bitcast(value, bx.cx.type_f64()),
+                Primitive::Int(Integer::I8, _) => bx.trunc(value, bx.type_i8()),
+                Primitive::Int(Integer::I16, _) => bx.trunc(value, bx.type_i16()),
+                Primitive::Float(Float::F16) => {
+                    let value = bx.trunc(value, bx.type_i16());
+                    bx.bitcast(value, bx.type_f16())
+                }
+                Primitive::Float(Float::F32) => bx.bitcast(value, bx.type_f32()),
+                Primitive::Float(Float::F64) => bx.bitcast(value, bx.type_f64()),
                 _ => value,
             }
+        }
+        (
+            Mips(MipsInlineAsmRegClass::freg | MipsInlineAsmRegClass::wreg),
+            BackendRepr::Scalar(s),
+        ) if s.primitive() == Primitive::Float(Float::F16) => {
+            let value = bx.bitcast(value, bx.type_i32());
+            let value = bx.trunc(value, bx.type_i16());
+            bx.bitcast(value, bx.type_f16())
         }
         (RiscV(RiscVInlineAsmRegClass::freg), BackendRepr::Scalar(s))
             if s.primitive() == Primitive::Float(Float::F16)
@@ -1424,16 +1486,25 @@ fn llvm_fixup_output<'ll, 'tcx>(
         (
             PowerPC(PowerPCInlineAsmRegClass::vreg | PowerPCInlineAsmRegClass::vsreg),
             BackendRepr::Scalar(s),
-        ) if let Primitive::Float(float @ (Float::F32 | Float::F64)) = s.primitive() => {
+        ) if let Primitive::Float(float @ (Float::F16 | Float::F32 | Float::F64)) =
+            s.primitive() =>
+        {
             let num_lanes = 16 / float.size().bytes();
+            // `f16` is located in the rightmost halfword of doubleword 0 per section 7.3.2.5 of
+            // "Power Instruction Set Architecture", version 3.1C.
+            let offset = if float == Float::F16 { 3 } else { 0 };
             bx.extract_element(
                 value,
                 bx.const_usize(match bx.target_spec().endian {
-                    Endian::Little => num_lanes - 1,
-                    Endian::Big => 0,
+                    Endian::Little => num_lanes - 1 - offset,
+                    Endian::Big => offset,
                 }),
             )
         }
+        (
+            PowerPC(PowerPCInlineAsmRegClass::vreg | PowerPCInlineAsmRegClass::vsreg),
+            BackendRepr::Scalar(s),
+        ) if s.primitive() == Primitive::Float(Float::F128) => bx.bitcast(value, bx.type_f128()),
         _ => value,
     }
 }
@@ -1559,11 +1630,16 @@ fn llvm_fixup_output_type<'ll, 'tcx>(
             match s.primitive() {
                 // MIPS only supports register-length arithmetics.
                 Primitive::Int(Integer::I8 | Integer::I16, _) => cx.type_i32(),
-                Primitive::Float(Float::F32) => cx.type_i32(),
+                Primitive::Float(Float::F16 | Float::F32) => cx.type_i32(),
                 Primitive::Float(Float::F64) => cx.type_i64(),
                 _ => layout.llvm_type(cx),
             }
         }
+
+        (
+            Mips(MipsInlineAsmRegClass::freg | MipsInlineAsmRegClass::wreg),
+            BackendRepr::Scalar(s),
+        ) if s.primitive() == Primitive::Float(Float::F16) => cx.type_f32(),
         (RiscV(RiscVInlineAsmRegClass::freg), BackendRepr::Scalar(s))
             if s.primitive() == Primitive::Float(Float::F16)
                 && !any_target_feature_enabled(cx, instance, &[sym::zfhmin, sym::zfh]) =>
@@ -1573,9 +1649,15 @@ fn llvm_fixup_output_type<'ll, 'tcx>(
         (
             PowerPC(PowerPCInlineAsmRegClass::vreg | PowerPCInlineAsmRegClass::vsreg),
             BackendRepr::Scalar(s),
-        ) if let Primitive::Float(float @ (Float::F32 | Float::F64)) = s.primitive() => {
+        ) if let Primitive::Float(float @ (Float::F16 | Float::F32 | Float::F64)) =
+            s.primitive() =>
+        {
             cx.type_vector(cx.type_from_float(float), 16 / float.size().bytes())
         }
+        (
+            PowerPC(PowerPCInlineAsmRegClass::vreg | PowerPCInlineAsmRegClass::vsreg),
+            BackendRepr::Scalar(s),
+        ) if s.primitive() == Primitive::Float(Float::F128) => cx.type_vector(cx.type_f64(), 2),
         _ => layout.llvm_type(cx),
     }
 }

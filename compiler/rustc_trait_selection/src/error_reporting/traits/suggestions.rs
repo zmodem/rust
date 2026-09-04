@@ -1119,12 +1119,29 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             .collect::<Vec<_>>()
             .join(", ");
 
-        if let ObligationCauseCode::FunctionArg { arg_hir_id, .. } = obligation.cause.code()
-            && obligation.cause.span.can_be_used_for_suggestions()
-        {
+        let callee_hir_id = match obligation.cause.code() {
+            ObligationCauseCode::FunctionArg { arg_hir_id, .. }
+                if obligation.cause.span.can_be_used_for_suggestions() =>
+            {
+                Some(*arg_hir_id)
+            }
+            // The iterator of a `for` loop is passed to `IntoIterator::into_iter`, so the failing
+            // `Iterator` goal is a derived obligation and `cause.span` carries the loop's
+            // desugaring context. The expression is still the user's, which its own span attests.
+            code => match code.peel_derives() {
+                ObligationCauseCode::ForLoopIterator(iter_hir_id)
+                    if self.tcx.hir_span(*iter_hir_id).can_be_used_for_suggestions() =>
+                {
+                    Some(*iter_hir_id)
+                }
+                _ => None,
+            },
+        };
+
+        if let Some(callee_hir_id) = callee_hir_id {
             let span = obligation.cause.span;
 
-            let arg_expr = match self.tcx.hir_node(*arg_hir_id) {
+            let arg_expr = match self.tcx.hir_node(callee_hir_id) {
                 hir::Node::Expr(expr) => Some(expr),
                 _ => None,
             };
@@ -1542,7 +1559,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     } else {
                         DefIdOrName::Name("type parameter")
                     };
-                    param_env.caller_bounds().iter().find_map(|clause| {
+                    param_env.caller_bounds().find_map(|clause| {
                         if let ty::ClauseKind::Projection(proj) = clause.kind().skip_binder()
                             && self
                                 .tcx
@@ -2536,34 +2553,187 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         span: Span,
         trait_pred: ty::PolyTraitClause<'tcx>,
     ) -> bool {
+        if !trait_pred.self_ty().skip_binder().is_unit() {
+            return false;
+        }
         let node = self.tcx.hir_node_by_def_id(obligation.cause.body_def_id);
-        if let hir::Node::Item(hir::Item { kind: hir::ItemKind::Fn {sig, body: body_id, .. }, .. }) = node
+        if let hir::Node::Item(hir::Item {
+            kind: hir::ItemKind::Fn { sig, body: body_id, .. }, ..
+        }) = node
             && let hir::ExprKind::Block(blk, _) = &self.tcx.hir_body(*body_id).value.kind
             && sig.decl.output.span().overlaps(span)
-            && blk.expr.is_none()
-            && trait_pred.self_ty().skip_binder().is_unit()
-            && let Some(stmt) = blk.stmts.last()
+            && let Some(candidate) = self.removable_trailing_semicolon(blk, obligation, trait_pred)
+        {
+            // A function body has a single return type, so keeping the value can't break any
+            // other use of it.
+            self.emit_semicolon_removal_suggestion(
+                err,
+                trait_pred,
+                candidate,
+                Applicability::MachineApplicable,
+            );
+            return true;
+        }
+        self.suggest_semicolon_removal_in_closure_arg(obligation, err, trait_pred)
+    }
+
+    /// If the value of `block` is discarded by a trailing semicolon and keeping it would satisfy
+    /// `trait_pred`, return that statement, its expression and the type of that expression.
+    fn removable_trailing_semicolon(
+        &self,
+        block: &hir::Block<'tcx>,
+        obligation: &PredicateObligation<'tcx>,
+        trait_pred: ty::PolyTraitClause<'tcx>,
+    ) -> Option<(&'tcx hir::Stmt<'tcx>, &'tcx hir::Expr<'tcx>, Ty<'tcx>)> {
+        if block.expr.is_none()
+            && let Some(stmt) = block.stmts.last()
             && let hir::StmtKind::Semi(expr) = stmt.kind
+            && !stmt.span.from_expansion()
+            && !matches!(expr.kind, hir::ExprKind::Err(_))
             // Only suggest this if the expression behind the semicolon implements the predicate
             && let Some(typeck_results) = &self.typeck_results
-            && let Some(ty) = typeck_results.expr_ty_opt(expr)
+            && let Some(ty) =
+                typeck_results.expr_ty_opt(expr).map(|ty| self.resolve_vars_if_possible(ty))
             && self.predicate_may_hold(&self.mk_trait_obligation_with_new_self_ty(
                 obligation.param_env, trait_pred.map_bound(|trait_pred| (trait_pred, ty))
             ))
         {
-            err.span_label(
-                expr.span,
-                format!(
-                    "this expression has type `{}`, which implements `{}`",
-                    ty,
-                    trait_pred.print_modifiers_and_trait_path()
-                ),
-            );
-            err.span_suggestion(
-                self.tcx.sess.source_map().end_point(stmt.span),
-                "remove this semicolon",
-                "",
-                Applicability::MachineApplicable,
+            Some((stmt, expr, ty))
+        } else {
+            None
+        }
+    }
+
+    fn emit_semicolon_removal_suggestion(
+        &self,
+        err: &mut Diag<'_>,
+        trait_pred: ty::PolyTraitClause<'tcx>,
+        (stmt, expr, ty): (&hir::Stmt<'_>, &hir::Expr<'_>, Ty<'tcx>),
+        applicability: Applicability,
+    ) {
+        err.span_label(
+            expr.span,
+            format!(
+                "this expression has type `{}`, which implements `{}`",
+                ty,
+                trait_pred.print_modifiers_and_trait_path()
+            ),
+        );
+        err.span_suggestion(
+            self.tcx.sess.source_map().end_point(stmt.span),
+            "remove this semicolon",
+            "",
+            applicability,
+        );
+    }
+
+    /// Detect when a closure argument returns `()` because of a trailing semicolon and that makes
+    /// a trait bound on the function's generic param fail, and suggest removing the semicolon:
+    ///
+    /// ```text
+    /// fn bar<R: Bar>(_: impl Fn() -> R) {}
+    /// bar(|| { 5u8; })
+    /// //          - help: remove this semicolon
+    /// ```
+    fn suggest_semicolon_removal_in_closure_arg(
+        &self,
+        obligation: &PredicateObligation<'tcx>,
+        err: &mut Diag<'_>,
+        trait_pred: ty::PolyTraitClause<'tcx>,
+    ) -> bool {
+        let &ObligationCauseCode::WhereClauseInExpr(callee_def_id, _, hir_id, idx) =
+            obligation.cause.code().peel_derives()
+        else {
+            return false;
+        };
+        // This cause code is used for the clauses of any item named in an expression, like an
+        // associated const or a type alias, and `fn_sig` is only defined for functions.
+        if !matches!(self.tcx.def_kind(callee_def_id), DefKind::Fn | DefKind::AssocFn) {
+            return false;
+        }
+        let hir::Node::Expr(expr) = self.tcx.hir_node(hir_id) else {
+            return false;
+        };
+        let Some(typeck_results) = &self.typeck_results else {
+            return false;
+        };
+        let args: Vec<&hir::Expr<'_>> =
+            match expr.kind {
+                hir::ExprKind::MethodCall(_, receiver, args, _) => {
+                    iter::once(receiver).chain(args).collect()
+                }
+                // For a call like `bar(..)` the obligation is attached to the callee path expression,
+                // so the arguments live in its parent.
+                _ => match self.tcx.parent_hir_node(expr.hir_id) {
+                    hir::Node::Expr(hir::Expr {
+                        kind: hir::ExprKind::Call(callee, args), ..
+                    }) if callee.hir_id == expr.hir_id => args.iter().collect(),
+                    _ => return false,
+                },
+            };
+        // Work with the callee's own clauses and signature, where the failing bound is still
+        // written in terms of the generic param it was declared on.
+        let clauses = self.tcx.clauses_of(callee_def_id).instantiate_identity(self.tcx);
+        let Some(ty::ClauseKind::Trait(failed)) = clauses
+            .clauses
+            .get(idx)
+            .map(|clause| clause.as_ref().skip_norm_wip().kind().skip_binder())
+        else {
+            return false;
+        };
+        let sig =
+            self.tcx.fn_sig(callee_def_id).instantiate_identity().skip_norm_wip().skip_binder();
+        let mut candidates = args.into_iter().enumerate().filter_map(|(i, arg)| {
+            // The bound has to be on what the closure returns. A bound on an unrelated param that
+            // also happened to be inferred as `()` would not be satisfied by removing a semicolon.
+            let declared = sig.inputs().get(i)?.peel_refs();
+            if !clauses.clauses.iter().any(|clause| {
+                matches!(
+                    clause.as_ref().skip_norm_wip().kind().skip_binder(),
+                    ty::ClauseKind::Projection(proj)
+                        if self.tcx.is_lang_item(proj.def_id(), LangItem::FnOnceOutput)
+                            && proj.projection_term.self_ty() == declared
+                            && proj.term.as_type() == Some(failed.self_ty())
+                )
+            }) {
+                return None;
+            }
+            // The error can be reported while the closure argument is still being checked, before
+            // its own type is recorded, so identify closures syntactically and only fall back to
+            // the argument's type (e.g. for a closure bound to a variable and passed by path).
+            let closure_def_id = match arg.kind {
+                hir::ExprKind::Closure(closure) => closure.def_id,
+                _ => match typeck_results
+                    .expr_ty_adjusted_opt(arg)
+                    .map(|ty| *self.resolve_vars_if_possible(ty).peel_refs().kind())
+                {
+                    Some(ty::Closure(def_id, _)) => def_id.as_local()?,
+                    _ => return None,
+                },
+            };
+            let hir::Node::Expr(hir::Expr { kind: hir::ExprKind::Closure(closure), .. }) =
+                self.tcx.hir_node_by_def_id(closure_def_id)
+            else {
+                return None;
+            };
+            let hir::ExprKind::Block(block, None) = self.tcx.hir_body(closure.body).value.kind
+            else {
+                return None;
+            };
+            self.removable_trailing_semicolon(block, obligation, trait_pred)
+        });
+        // Only emit the suggestion when a single closure argument matches, to avoid pointing at
+        // an unrelated closure.
+        if let Some(candidate) = candidates.next()
+            && candidates.next().is_none()
+        {
+            // The same closure can be passed to somewhere else that expects it to return `()`,
+            // where keeping the value would introduce a new error.
+            self.emit_semicolon_removal_suggestion(
+                err,
+                trait_pred,
+                candidate,
+                Applicability::MaybeIncorrect,
             );
             return true;
         }
@@ -3626,7 +3796,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             | ObligationCauseCode::ReturnValue(_)
             | ObligationCauseCode::BlockTailExpression(..)
             | ObligationCauseCode::AwaitableExpr(_)
-            | ObligationCauseCode::ForLoopIterator
+            | ObligationCauseCode::ForLoopIterator(_)
             | ObligationCauseCode::QuestionMark
             | ObligationCauseCode::CheckAssociatedTypeBounds { .. }
             | ObligationCauseCode::LetElse
@@ -4367,7 +4537,13 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                             }
                         }
                         err.span_note(spans, msg);
-                        if derived && trait_name != "Copy" {
+                        if derived
+                            && self.is_truly_imperfect_derive(
+                                parent_trait_pred,
+                                predicate,
+                                param_env,
+                            )
+                        {
                             err.help(format!(
                                 "consider manually implementing `{trait_name}` to avoid undesired bounds caused by \"imperfect derives\"",
                             ));
@@ -6318,6 +6494,90 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             }
             _ => {}
         }
+    }
+
+    /// Checks whether the field independently satisfies the trait bound, ignoring
+    /// the specific generic parameter that caused the original E0277 error.
+    fn is_truly_imperfect_derive(
+        &self,
+        parent_trait_pred: ty::PolyTraitClause<'tcx>,
+        predicate: ty::Predicate<'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
+    ) -> bool {
+        let tcx = self.tcx;
+        let ty::Adt(adt_def, parent_args) = parent_trait_pred.skip_binder().self_ty().kind() else {
+            return false;
+        };
+        let Some(trait_clause) = predicate.as_trait_clause() else {
+            return false;
+        };
+        let failing_ty = trait_clause.skip_binder().self_ty();
+        let trait_def_id = parent_trait_pred.def_id();
+
+        let failing_adt_param_indices: FxHashSet<u32> = parent_args
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, arg)| {
+                if let Some(t) = arg.as_type()
+                    && t == failing_ty
+                {
+                    Some(idx as u32)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if failing_adt_param_indices.is_empty() {
+            return false;
+        }
+
+        adt_def.all_fields().all(|field| {
+            let raw_field_ty = tcx.type_of(field.did).skip_binder();
+            // If the field type is exactly one of the failing parameters, it is not an imperfect derive.
+            if let ty::Param(p) = raw_field_ty.kind()
+                && failing_adt_param_indices.contains(&p.index)
+            {
+                return false;
+            }
+            // If the field type doesn't mention the parameter at all, it's independent.
+            if !raw_field_ty.walk().any(|arg| {
+                matches!(arg.as_type().map(|t| t.kind()), Some(ty::Param(p)) if failing_adt_param_indices.contains(&p.index))
+            }) {
+                return true;
+            }
+
+            self.probe(|_| {
+                // We keep the generic parameters that didn't fail as-is from the parent args,
+                // but replace the ones that did fail with fresh inference variable placeholders.
+                let fresh_args = ty::GenericArgs::for_item(tcx, adt_def.did(), |param, _| {
+                    if failing_adt_param_indices.contains(&param.index) {
+                        self.var_for_def(DUMMY_SP, param)
+                    } else {
+                        parent_args[param.index as usize]
+                    }
+                });
+
+                let field_ty = field.ty(tcx, fresh_args).skip_norm_wip();
+                // Substitute the field's type for the bound's `Self` type to check whether
+                // the field alone would satisfy the trait, independent of other generics.
+                let parent_trait_args = parent_trait_pred.skip_binder().trait_ref.args;
+                let trait_args = parent_trait_args.iter().map(|arg| {
+                    if arg.as_type() == Some(parent_trait_pred.skip_binder().self_ty()) {
+                        field_ty.into()
+                    } else {
+                        arg
+                    }
+                });
+                let obligation = Obligation::new(
+                    tcx,
+                    ObligationCause::dummy(),
+                    param_env,
+                    ty::TraitRef::new(tcx, trait_def_id, trait_args),
+                );
+                self.predicate_may_hold(&obligation)
+            })
+        })
     }
 }
 
