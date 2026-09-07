@@ -24,3 +24,13 @@
 //! ```
 //! let x = 0; //! assert!(true);
 //! ```
+
+/// ```
+/// /// doc comment
+/// ```
+struct Test;
+
+/// ```
+/// #[cfg(true)] {
+/// }    /// ```
+pub fn wtf() {}
