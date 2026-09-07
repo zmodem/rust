@@ -439,15 +439,6 @@ fn copy_self_contained_objects(
             )
         });
 
-        // wasm32-wasip3 doesn't exist in wasi-libc yet, so instead use libs
-        // from the wasm32-wasip2 target. Once wasi-libc supports wasip3 this
-        // should be deleted and the native objects should be used.
-        let srcdir = if target == "wasm32-wasip3" {
-            assert!(!srcdir.exists(), "wasip3 support is in wasi-libc, this should be updated now");
-            builder.wasi_libdir(TargetSelection::from_user("wasm32-wasip2")).unwrap()
-        } else {
-            srcdir
-        };
         for &obj in &["libc.a", "crt1-command.o", "crt1-reactor.o"] {
             copy_and_stamp(
                 builder,
@@ -2529,7 +2520,8 @@ impl CommandLineStep for Assemble {
         }
 
         // In addition to `rust-lld` also install `wasm-component-ld` when
-        // is enabled. This is used by the `wasm32-wasip2` target of Rust.
+        // is enabled. This is used by targets that produce WebAssembly
+        // components in Rust such as `wasm32-wasip{2,3}`.
         if builder.tool_enabled("wasm-component-ld") {
             let wasm_component = builder.ensure(
                 crate::core::build_steps::tool::WasmComponentLd::for_use_by_compiler(
@@ -2677,7 +2669,7 @@ pub fn run_cargo(
         let (filenames_vec, crate_types) = match msg {
             CargoMessage::CompilerArtifact {
                 filenames,
-                target: CargoTarget { crate_types, .. },
+                target: CargoTarget { crate_types },
                 ..
             } => {
                 let mut f: Vec<String> = filenames.into_iter().map(|s| s.into_owned()).collect();
@@ -2884,14 +2876,12 @@ pub fn stream_cargo(
     status.success()
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 pub struct CargoTarget<'a> {
-    pub crate_types: Vec<Cow<'a, str>>,
-    #[serde(default)]
-    pub doc: bool,
+    crate_types: Vec<Cow<'a, str>>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize)]
 #[serde(tag = "reason", rename_all = "kebab-case")]
 pub enum CargoMessage<'a> {
     CompilerArtifact { filenames: Vec<Cow<'a, str>>, target: CargoTarget<'a> },
