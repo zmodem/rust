@@ -55,7 +55,7 @@ use rustc_data_structures::unord::ExtendUnord;
 use rustc_errors::codes::*;
 use rustc_errors::{DiagArgFromDisplay, DiagCtxtHandle, ErrorGuaranteed};
 use rustc_hir::attrs::lang_items::LangItem;
-use rustc_hir::def::{DefKind, LifetimeRes, Namespace, PartialRes, PerNS, Res};
+use rustc_hir::def::{DefKind, Namespace, PerNS, Res};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId, LocalDefIdMap};
 use rustc_hir::definitions::PerParentDisambiguatorState;
 use rustc_hir::lints::DelayedLint;
@@ -63,11 +63,14 @@ use rustc_hir::{
     self as hir, AngleBrackets, ConstArg, GenericArg, HirId, ItemLocalMap, LifetimeSource,
     LifetimeSyntax, MissingLifetimeKind, ParamName, Target, TraitCandidate, find_attr,
 };
-use rustc_index::{Idx, IndexVec};
+use rustc_index::{Idx, IndexSlice, IndexVec};
 use rustc_macros::extension;
+use rustc_middle::middle::resolve::{
+    AstOwner, LifetimeRes, PartialRes, PerOwnerResolverData, ResolverAstLowering,
+};
 use rustc_middle::queries::Providers;
 use rustc_middle::span_bug;
-use rustc_middle::ty::{PerOwnerResolverData, ResolverAstLowering, TyCtxt};
+use rustc_middle::ty::TyCtxt;
 use rustc_session::diagnostics::add_feature_diagnostics;
 use rustc_span::symbol::{Ident, Symbol, kw, sym};
 use rustc_span::{DUMMY_SP, DesugaringKind, Span};
@@ -576,7 +579,7 @@ enum TryBlockScope {
 fn index_ast<'tcx>(
     tcx: TyCtxt<'tcx>,
     (): (),
-) -> IndexVec<LocalDefId, Steal<(Arc<ResolverAstLowering<'tcx>>, AstOwner)>> {
+) -> &'tcx IndexSlice<LocalDefId, Steal<(Arc<ResolverAstLowering<'tcx>>, AstOwner)>> {
     // Queries that borrow `resolver_for_lowering`.
     tcx.ensure_done().output_filenames(());
     tcx.ensure_done().early_lint_checks(());
@@ -598,8 +601,9 @@ fn index_ast<'tcx>(
 
     let index = indexer.index;
     let resolver = Arc::new(resolver);
-    let index = index.into_iter().map(|owner| Steal::new((Arc::clone(&resolver), owner))).collect();
-    return index;
+    return tcx.arena.alloc_index_slice_from_iter::<LocalDefId, _, _>(
+        index.into_iter().map(|owner| Steal::new((Arc::clone(&resolver), owner))),
+    );
 
     struct Indexer<'s, 'hir> {
         owners: &'s NodeMap<PerOwnerResolverData<'hir>>,
@@ -2672,19 +2676,41 @@ impl<'hir> LoweringContext<'_, 'hir> {
     ) -> hir::ConstItemRhs<'hir> {
         match (body, kind) {
             (body, ConstItemKind::Body) => {
-                hir::ConstItemRhs::Body(self.lower_const_body(span, body.as_deref()))
+                let is_direct = |body| {
+                    if self.tcx.features().macroless_generic_const_args() {
+                        self.can_lower_expr_to_const_arg_direct(
+                            body,
+                            DirectConstArgContext::MacrolessMinGenericConstArgs,
+                        )
+                        .is_ok()
+                    } else {
+                        // do not check can_lower_expr_to_const_arg_direct, but rather just
+                        // ExprKind::DirectConstArg, because we don't want e.g.
+                        // `impl<const N: u8> { const C: u8 = N; }` to be a direct-rhs const
+                        matches!(body, Expr { kind: ExprKind::DirectConstArg(_), .. })
+                    }
+                };
+                // N.B.: the feature gate for this is generic_const_args, not min_generic_const_args
+                if self.tcx.features().generic_const_args()
+                    && let Some(body) = body
+                    && is_direct(body)
+                {
+                    hir::ConstItemRhs::Direct(
+                        self.arena.alloc(self.lower_expr_to_const_arg_direct(&body, None)),
+                    )
+                } else {
+                    hir::ConstItemRhs::Body(self.lower_const_body(span, body.as_deref()))
+                }
             }
-            (Some(body), ConstItemKind::TypeConst) => {
-                hir::ConstItemRhs::TypeConst(self.arena.alloc(
-                    match self.can_lower_expr_to_const_arg_direct(
-                        &body,
-                        DirectConstArgContext::MacrolessMinGenericConstArgs,
-                    ) {
-                        Ok(()) => self.lower_expr_to_const_arg_direct(&body, None),
-                        Err(err) => err.emit(self),
-                    },
-                ))
-            }
+            (Some(body), ConstItemKind::TypeConst) => hir::ConstItemRhs::Direct(self.arena.alloc(
+                match self.can_lower_expr_to_const_arg_direct(
+                    &body,
+                    DirectConstArgContext::MacrolessMinGenericConstArgs,
+                ) {
+                    Ok(()) => self.lower_expr_to_const_arg_direct(&body, None),
+                    Err(err) => err.emit(self),
+                },
+            )),
             (None, ConstItemKind::TypeConst) => {
                 let const_arg = ConstArg {
                     hir_id: self.next_id(),
@@ -2693,7 +2719,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                     ),
                     span: DUMMY_SP,
                 };
-                hir::ConstItemRhs::TypeConst(self.arena.alloc(const_arg))
+                hir::ConstItemRhs::Direct(self.arena.alloc(const_arg))
             }
         }
     }
