@@ -12,7 +12,7 @@ use rustc_lint_defs::builtin::LONG_RUNNING_CONST_EVAL;
 use rustc_middle::mir::AssertMessage;
 use rustc_middle::mir::interpret::ReportedErrorInfo;
 use rustc_middle::query::TyCtxtAt;
-use rustc_middle::ty::layout::{HasTypingEnv, TyAndLayout, ValidityRequirement};
+use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, TyAndLayout, ValidityRequirement};
 use rustc_middle::ty::{self, FieldInfo, ScalarInt, Ty, TyCtxt};
 use rustc_middle::{bug, mir, span_bug};
 use rustc_span::{Span, Symbol, sym};
@@ -636,6 +636,30 @@ impl<'tcx> interpret::Machine<'tcx> for CompileTimeMachine<'tcx> {
                     ecx.project_downcast_named(dest, sym::None)?.0
                 };
                 ecx.write_discriminant(variant_index, dest)?;
+            }
+
+            sym::type_id_element_ty => {
+                let ty = ecx.read_type_id(&args[0])?;
+                let variant_index = if let ty::Array(ty, _) | ty::Slice(ty) = ty.kind() {
+                    let (variant_idx, variant_place) =
+                        ecx.project_downcast_named(dest, sym::Some)?;
+                    let type_id_field_place = ecx.project_field(&variant_place, FieldIdx::ZERO)?;
+                    ecx.write_type_id(*ty, &type_id_field_place)?;
+                    variant_idx
+                } else {
+                    ecx.project_downcast_named(dest, sym::None)?.0
+                };
+                ecx.write_discriminant(variant_index, dest)?;
+            }
+
+            sym::type_id_array_len => {
+                let ty = ecx.read_type_id(&args[0])?;
+                let len = if let ty::Array(_, len) = ty.kind() {
+                    len.to_leaf().to_target_usize(ecx.tcx.tcx())
+                } else {
+                    0
+                };
+                ecx.write_scalar(Scalar::from_target_usize(len, ecx), dest)?;
             }
 
             sym::type_id_fields => {
